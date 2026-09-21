@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+#
+# azure_migrate_container.sh — Copy an Azure Storage blob container from one
+# storage account/subscription/tenant to another (cross-tenant safe), without
+# requiring any AAD trust or RBAC between the two tenants.
+#
+# Like azure_migrate_disk.sh, this moves the bytes over plain HTTPS using SAS
+# tokens rather than AAD-authenticated `az storage` RBAC, so the two sides
+# never need to trust each other's tenant:
+#
+# What it does, in order:
+#   1. Logs into the SOURCE tenant/subscription (service principal, if
+#      SRC_AZURE_* creds are set, else assumes an existing `az login` session
+#      that already has that subscription in its token cache) — SKIPPED
+#      entirely if SRC_ACCOUNT_KEY is supplied (see below).
+#   2. Grants a time-limited, read+list SAS on the source container.
+#   3. Logs into the DESTINATION tenant/subscription and provisions (or
+#      reuses) the destination storage account + container — login SKIPPED
+#      if DST_ACCOUNT_KEY is supplied, but the account must then already
+#      exist (creating a storage account is a management-plane operation
+#      and needs an authenticated session; the container itself can still
+#      be created with just the key, since that's data-plane).
+#   4. Grants a time-limited, write+create SAS on the destination container.
+#   5. Runs `azcopy copy <source SAS URL> <dest SAS URL> --recursive` — a
+#      plain SAS-to-SAS container copy, so it never needs both tenants
+#      authenticated at once and never needs cross-tenant RBAC.
+#   6. Verifies blob counts match on both sides.
+#
+# Credentials are NEVER hardcoded. Two auth modes per side, tried in order:
+#   1. --src-account-key / --dst-account-key (or SRC_ACCOUNT_KEY /
+#      DST_ACCOUNT_KEY env/.env) — the storage account's own access key. If
+#      set, --src-rg/--src-subscription (or dst-) are not needed at all: the
+#      key authenticates data-plane calls directly, no `az login` involved.
+#      NOTE: an account key grants full read/write on the *entire* account
+#      (every container), not just this one — prefer service-principal auth
+#      below when you can, and treat this key with the same care as a root
+#      password.
+#   2. SRC_AZURE_CLIENT_SECRET / DST_AZURE_CLIENT_SECRET service-principal
+#      creds (env or .env file); if unset, the script skips `az login` for
+#      that side and expects the subscription to already be usable via an
+#      existing `az login` session. The account's key is then fetched via
+#      `az storage account keys list` under that session, scoped only to
+#      whatever RBAC that principal/session already has.
+#
+# Usage:
+#   ./azure_migrate_container.sh --container <name> \
+#       --src-account <name> --src-rg <rg> --src-subscription <id> [--src-tenant <id>] \
+#       --dst-account <name> --dst-rg <rg> --dst-subscription <id> [--dst-tenant <id>] \
+#       [--dst-container <newname>] [--dst-location <region>] [--dst-sku <sku>] \
+#       [--sas-duration <seconds>] [--drop-existing]
+#   # or, skipping az login on one/both sides:
+#   ./azure_migrate_container.sh --container <name> \
+#       --src-account <name> --src-account-key '...' \
+#       --dst-account <name> --dst-account-key '...' \
+#       [--dst-container <newname>] [--drop-existing]
+#
+# Service principal creds (set whichever side needs a fresh login, or put
+# them in .env.azure):
+#   export SRC_AZURE_TENANT_ID='...'
+#   export SRC_AZURE_CLIENT_ID='...'
+#   export SRC_AZURE_CLIENT_SECRET='...'
+#   export DST_AZURE_TENANT_ID='...'
+#   export DST_AZURE_CLIENT_ID='...'
+#   export DST_AZURE_CLIENT_SECRET='...'
+# Or, storage account keys (bypasses az login entirely for that side):
+#   export SRC_ACCOUNT_KEY='...'
+#   export DST_ACCOUNT_KEY='...'
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Defaults / arg parsing
+# ---------------------------------------------------------------------------
+CONTAINER="" ; DST_CONTAINER=""
+SRC_ACCOUNT="" ; SRC_RG="" ; SRC_SUB="" ; SRC_TENANT="" ; SRC_ACCOUNT_KEY=""
+DST_ACCOUNT="" ; DST_RG="" ; DST_SUB="" ; DST_TENANT="" ; DST_ACCOUNT_KEY=""
+DST_LOCATION="" ; DST_SKU="Standard_LRS"
+SAS_DURATION="14400"   # 4 hours
+DROP_EXISTING=0
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+info() { echo ">>> $*" >&2; }
+
+usage() { sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# ---------------------------------------------------------------------------
+# Load an env file sitting next to this script: ".env.azure" is preferred,
+# else ".env" (override with ENV_FILE=...), shared with azure_migrate_disk.sh.
+# Precedence: CLI flags > env file > built-in defaults.
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${ENV_FILE:-}" ]]; then
+  if   [[ -f "$SCRIPT_DIR/.env.azure" ]]; then ENV_FILE="$SCRIPT_DIR/.env.azure"
+  else ENV_FILE="$SCRIPT_DIR/.env"; fi
+fi
+if [[ -f "$ENV_FILE" ]]; then
+  info "Loading configuration from $ENV_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --container)        CONTAINER="$2"; shift 2 ;;
+    --dst-container)     DST_CONTAINER="$2"; shift 2 ;;
+    --src-account)       SRC_ACCOUNT="$2"; shift 2 ;;
+    --src-rg)            SRC_RG="$2"; shift 2 ;;
+    --src-subscription)  SRC_SUB="$2"; shift 2 ;;
+    --src-tenant)        SRC_TENANT="$2"; shift 2 ;;
+    --src-account-key)   SRC_ACCOUNT_KEY="$2"; shift 2 ;;
+    --dst-account)       DST_ACCOUNT="$2"; shift 2 ;;
+    --dst-rg)            DST_RG="$2"; shift 2 ;;
+    --dst-subscription)  DST_SUB="$2"; shift 2 ;;
+    --dst-tenant)        DST_TENANT="$2"; shift 2 ;;
+    --dst-account-key)   DST_ACCOUNT_KEY="$2"; shift 2 ;;
+    --dst-location)      DST_LOCATION="$2"; shift 2 ;;
+    --dst-sku)           DST_SKU="$2"; shift 2 ;;
+    --sas-duration)      SAS_DURATION="$2"; shift 2 ;;
+    --drop-existing)     DROP_EXISTING=1; shift ;;
+    -h|--help)           usage 0 ;;
+    *)                   die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+
+[[ -n "$CONTAINER"   ]] || die "--container is required"
+[[ -n "$SRC_ACCOUNT" ]] || die "--src-account is required"
+[[ -n "$DST_ACCOUNT" ]] || die "--dst-account is required"
+if [[ -z "$SRC_ACCOUNT_KEY" ]]; then
+  [[ -n "$SRC_RG"  ]] || die "--src-rg is required (unless --src-account-key is given)"
+  [[ -n "$SRC_SUB" ]] || die "--src-subscription is required (unless --src-account-key is given)"
+fi
+if [[ -z "$DST_ACCOUNT_KEY" ]]; then
+  [[ -n "$DST_RG"  ]] || die "--dst-rg is required (unless --dst-account-key is given)"
+  [[ -n "$DST_SUB" ]] || die "--dst-subscription is required (unless --dst-account-key is given)"
+fi
+DST_CONTAINER="${DST_CONTAINER:-$CONTAINER}"
+
+for bin in az azcopy; do
+  command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found on PATH"
+done
+
+# ---------------------------------------------------------------------------
+# Context helpers — switch the active az CLI subscription, logging in with a
+# service principal first if creds were supplied for that side.
+# ---------------------------------------------------------------------------
+use_src() {
+  if [[ -n "${SRC_AZURE_CLIENT_SECRET:-}" ]]; then
+    [[ -n "${SRC_AZURE_CLIENT_ID:-}" && -n "${SRC_AZURE_TENANT_ID:-}" ]] \
+      || die "SRC_AZURE_CLIENT_SECRET set but SRC_AZURE_CLIENT_ID/SRC_AZURE_TENANT_ID missing"
+    az login --service-principal -u "$SRC_AZURE_CLIENT_ID" \
+      -p "$SRC_AZURE_CLIENT_SECRET" --tenant "$SRC_AZURE_TENANT_ID" -o none
+  fi
+  az account set --subscription "$SRC_SUB"
+}
+use_dst() {
+  if [[ -n "${DST_AZURE_CLIENT_SECRET:-}" ]]; then
+    [[ -n "${DST_AZURE_CLIENT_ID:-}" && -n "${DST_AZURE_TENANT_ID:-}" ]] \
+      || die "DST_AZURE_CLIENT_SECRET set but DST_AZURE_CLIENT_ID/DST_AZURE_TENANT_ID missing"
+    az login --service-principal -u "$DST_AZURE_CLIENT_ID" \
+      -p "$DST_AZURE_CLIENT_SECRET" --tenant "$DST_AZURE_TENANT_ID" -o none
+  fi
+  az account set --subscription "$DST_SUB"
+}
+
+# ---------------------------------------------------------------------------
+# 0. Source side: locate the account/container, grant a read+list SAS
+# ---------------------------------------------------------------------------
+if [[ -n "$SRC_ACCOUNT_KEY" ]]; then
+  info "Using supplied source account key — skipping az login."
+  SRC_KEY="$SRC_ACCOUNT_KEY"
+else
+  info "Switching to source subscription ($SRC_SUB)…"
+  use_src
+  az storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT" >/dev/null 2>&1 \
+    || die "source storage account '$SRC_ACCOUNT' not found in '$SRC_RG'"
+  SRC_KEY="$(az storage account keys list -g "$SRC_RG" -n "$SRC_ACCOUNT" \
+    --query '[0].value' -o tsv)"
+fi
+
+az storage container show --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" \
+  -n "$CONTAINER" >/dev/null 2>&1 \
+  || die "source container '$CONTAINER' not found in account '$SRC_ACCOUNT'"
+
+SRC_COUNT="$(az storage blob list --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" \
+  -c "$CONTAINER" --num-results '*' --query 'length(@)' -o tsv)"
+info "Source container '$CONTAINER' has $SRC_COUNT blob(s)."
+
+EXPIRY="$(date -u -d "+${SAS_DURATION} seconds" '+%Y-%m-%dT%H:%MZ' 2>/dev/null \
+  || date -u -v"+${SAS_DURATION}S" '+%Y-%m-%dT%H:%MZ')"
+SRC_SAS_TOKEN="$(az storage container generate-sas --account-name "$SRC_ACCOUNT" \
+  --account-key "$SRC_KEY" -n "$CONTAINER" --permissions rl --expiry "$EXPIRY" -o tsv)"
+SRC_SAS_URL="https://${SRC_ACCOUNT}.blob.core.windows.net/${CONTAINER}?${SRC_SAS_TOKEN}"
+
+# ---------------------------------------------------------------------------
+# 1. Destination side: storage account + container + write SAS
+# ---------------------------------------------------------------------------
+if [[ -n "$DST_ACCOUNT_KEY" ]]; then
+  info "Using supplied destination account key — skipping az login."
+  info "(Account creation needs an authenticated session, so the account must already exist.)"
+  DST_KEY="$DST_ACCOUNT_KEY"
+else
+  info "Switching to destination subscription ($DST_SUB)…"
+  use_dst
+
+  az group show -g "$DST_RG" >/dev/null 2>&1 || die "destination resource group '$DST_RG' does not exist"
+
+  if ! az storage account show -g "$DST_RG" -n "$DST_ACCOUNT" >/dev/null 2>&1; then
+    [[ -n "$DST_LOCATION" ]] || die "destination storage account '$DST_ACCOUNT' does not exist — pass --dst-location to create it"
+    info "Creating destination storage account '$DST_ACCOUNT'…"
+    az storage account create -g "$DST_RG" -n "$DST_ACCOUNT" \
+      -l "$DST_LOCATION" --sku "$DST_SKU" --kind StorageV2 -o none
+  fi
+  DST_KEY="$(az storage account keys list -g "$DST_RG" -n "$DST_ACCOUNT" \
+    --query '[0].value' -o tsv)"
+fi
+
+if az storage container show --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+    -n "$DST_CONTAINER" >/dev/null 2>&1; then
+  if [[ "$DROP_EXISTING" -eq 1 ]]; then
+    info "Deleting existing blobs in destination container '$DST_CONTAINER'…"
+    az storage blob delete-batch --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+      -s "$DST_CONTAINER" -o none
+  fi
+else
+  info "Creating destination container '$DST_CONTAINER'…"
+  az storage container create --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+    -n "$DST_CONTAINER" -o none
+fi
+
+DST_SAS_TOKEN="$(az storage container generate-sas --account-name "$DST_ACCOUNT" \
+  --account-key "$DST_KEY" -n "$DST_CONTAINER" --permissions cwl --expiry "$EXPIRY" -o tsv)"
+DST_SAS_URL="https://${DST_ACCOUNT}.blob.core.windows.net/${DST_CONTAINER}?${DST_SAS_TOKEN}"
+
+# ---------------------------------------------------------------------------
+# 2. Copy — plain SAS-to-SAS transfer, no AAD/tenant involvement
+# ---------------------------------------------------------------------------
+info "Copying container via azcopy (this is the slow part)…"
+azcopy copy "$SRC_SAS_URL" "$DST_SAS_URL" --recursive=true
+
+# ---------------------------------------------------------------------------
+# 3. Verification
+# ---------------------------------------------------------------------------
+DST_COUNT="$(az storage blob list --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+  -c "$DST_CONTAINER" --num-results '*' --query 'length(@)' -o tsv)"
+info "Blob count — source: $SRC_COUNT, destination: $DST_COUNT"
+if [[ "$SRC_COUNT" == "$DST_COUNT" ]]; then
+  info "Migration complete. Container '$DST_CONTAINER' populated in account '$DST_ACCOUNT' ($DST_SUB)."
+else
+  info "WARNING: blob counts differ. Investigate before relying on '$DST_CONTAINER'."
+  exit 2
+fi
