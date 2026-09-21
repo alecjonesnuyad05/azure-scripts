@@ -212,9 +212,20 @@ az snapshot create -g "$SRC_RG" -n "$SNAPSHOT_NAME" --source "$DISK_ID" \
   --incremental false -o none
 
 info "Granting a ${SAS_DURATION}s read-only SAS on the snapshot…"
-SRC_SAS_URL="$(az snapshot grant-access -g "$SRC_RG" -n "$SNAPSHOT_NAME" \
-  --access-level Read --duration-in-seconds "$SAS_DURATION" --query accessSas -o tsv)"
-[[ -n "$SRC_SAS_URL" ]] || die "failed to obtain source SAS URL"
+SNAPSHOT_ACCESS_JSON="$(az snapshot grant-access -g "$SRC_RG" -n "$SNAPSHOT_NAME" \
+  --access-level Read --duration-in-seconds "$SAS_DURATION" -o json)" \
+  || die "az snapshot grant-access failed"
+SRC_SAS_URL="$(printf '%s' "$SNAPSHOT_ACCESS_JSON" \
+  | grep -o '"accessSas"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed -E 's/.*: *"([^"]*)"/\1/')"
+if [[ -z "$SRC_SAS_URL" ]]; then
+  info "az snapshot grant-access returned no accessSas — raw response (this is the actual"
+  info "diagnostic: e.g. a NetworkAccessPolicy/PublicNetworkAccess restriction on the disk"
+  info "or snapshot commonly surfaces here as a null accessSas with an otherwise-successful"
+  info "call):"
+  printf '%s\n' "$SNAPSHOT_ACCESS_JSON" | sed 's/^/         /' >&2
+  die "failed to obtain source SAS URL (see raw response above)"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Destination side: staging storage account + container + write SAS
