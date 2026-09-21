@@ -223,6 +223,63 @@ even on a successful copy.
 **Lint/test:** `bash -n azure_migrate_container.sh` / `shellcheck`. No
 automated test suite — validate against throwaway containers first.
 
+### `azure_migrate_fileshare.sh`
+
+Copies an Azure Files share from one storage account/subscription/tenant to
+another (cross-tenant safe), using the same SAS-to-SAS approach and
+`az_check`/`az_exists` error-surfacing as `azure_migrate_container.sh` —
+adapted for Azure Files' hierarchical directories instead of a flat blob
+namespace. `az storage file list` only lists one directory level at a time
+(no recursive flag), so file counts (pre-copy source count, post-copy
+verification) are done via `azcopy list` against a SAS URL instead, counting
+`Content Length:` entries recursively.
+
+Flow: log into source sub → grant a read+list SAS on the source share, count
+its files via `azcopy list` → log into destination sub → create/reuse the
+destination storage account + share → grant a write+create SAS on it →
+`azcopy copy --recursive` (SAS-to-SAS) → recount via `azcopy list` and
+verify file counts match.
+
+**Run:**
+```bash
+export SRC_AZURE_CLIENT_SECRET='...'   # source SP secret (or reuse an existing `az login`)
+export DST_AZURE_CLIENT_SECRET='...'   # destination SP secret
+./azure_migrate_fileshare.sh --share myshare \
+    --src-account srcstorage --src-rg my-src-rg --src-subscription <src-sub-id> \
+    --dst-account dststorage --dst-rg my-dst-rg --dst-subscription <dst-sub-id> \
+    [--dst-share newname] [--dst-location westeurope] [--dst-sku Standard_LRS] \
+    [--dst-quota-gb 100] [--drop-existing] [--dry-run]
+```
+`--help` prints full usage. `--dry-run` authenticates both sides, recursively
+counts the source share's files, checks whether the destination
+account/share already exist, and prints exactly what would happen, without
+granting a write SAS, creating an account/share, running azcopy, or deleting
+files. `--list-src-shares` authenticates to the source account only, lists
+its shares (name, quota) and exits — no `--share` or `--dst-*` needed, e.g.:
+```bash
+./azure_migrate_fileshare.sh --src-account srcstorage --src-account-key '...' --list-src-shares
+```
+Shares `.env.azure`/`.env`, the `SRC_AZURE_*`/`DST_AZURE_*` service-principal
+env vars, and `SRC_ACCOUNT_KEY`/`DST_ACCOUNT_KEY` with
+`azure_migrate_container.sh` and `azure_migrate_disk.sh` (same precedence:
+CLI flags > env file > defaults). Requires `az` and `azcopy` on PATH. Run
+under Bash, not PowerShell.
+
+**Alternative auth — storage account key:** same as `azure_migrate_container.sh`
+— pass `--src-account-key`/`--dst-account-key` (or `SRC_ACCOUNT_KEY`/
+`DST_ACCOUNT_KEY`) to skip `az login` and `--src-rg`/`--src-subscription`
+(or `dst-`) entirely for that side. Same blast-radius caveat: an account key
+grants full read/write on the *entire* account, not just the one share.
+
+**Note:** file-count verification assumes the destination share was empty
+(or `--drop-existing` was used) before the copy — copying into a non-empty
+share without `--drop-existing` will make the counts diverge even on a
+successful copy. `--drop-existing` deletes files (`az storage file
+delete-batch`), not the share itself.
+
+**Lint/test:** `bash -n azure_migrate_fileshare.sh` / `shellcheck`. No
+automated test suite — validate against a throwaway share first.
+
 ## Environment
 
 - Windows 11; primary shell is PowerShell. A Bash (POSIX) shell is also available — use the syntax matching whichever you invoke.
