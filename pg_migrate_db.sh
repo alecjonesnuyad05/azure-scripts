@@ -6,12 +6,17 @@
 # What it does, in order:
 #   1. Connects to the SOURCE with admin credentials.
 #   2. Auto-detects the database's owner role.
-#   3. Dumps that role via `pg_dumpall --roles-only` and keeps only the
-#      statements for that role — this preserves the encrypted password hash
-#      (SCRAM-SHA-256 / md5), so the password is never seen in plaintext and
-#      is identical on the target.
-#   4. Recreates the role on the TARGET (skipped if it already exists, so an
-#      existing password is never clobbered — override with --force-role).
+#   3. Checks whether that role already exists on the TARGET; if so (and
+#      --force-role wasn't given) it's left untouched and step 4 is skipped
+#      entirely — no need to touch the source's role data at all.
+#   4. Otherwise, dumps that role via `pg_dumpall --roles-only` and keeps
+#      only the statements for that role — this preserves the encrypted
+#      password hash (SCRAM-SHA-256 / md5), so the password is never seen in
+#      plaintext and is identical on the target. This requires the source
+#      admin to be a true superuser (SELECT on pg_authid); on managed
+#      Postgres (Azure Database for PostgreSQL, RDS, Cloud SQL) where it
+#      usually isn't, the script instead falls back to creating the role
+#      with a FRESH password (see NEW_ROLE_PASSWORD below).
 #   5. Creates the target database owned by that role.
 #   6. Dumps the source database (custom format) and restores it to the target,
 #      preserving object ownership.
@@ -36,6 +41,15 @@
 #   export DST_PGPASSWORD='...'   # target admin password
 #   (or configure ~/.pgpass; the script falls back to it if these are unset.)
 #
+# Managed Postgres (Azure Database for PostgreSQL, RDS, Cloud SQL) fallback:
+# copying the role's password hash requires SELECT on pg_authid, which is
+# restricted to true superusers — managed-service admin logins usually
+# aren't. If the target role doesn't already exist and the source admin
+# can't read pg_authid, the script falls back to creating it with a FRESH
+# password (other attributes are still carried over via pg_roles, which is
+# publicly readable). Set this to enable the fallback:
+#   export NEW_ROLE_PASSWORD='...'   # or --new-role-password on the CLI
+#
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -44,11 +58,12 @@ set -euo pipefail
 SRC_HOST="" ; SRC_PORT="5432" ; SRC_ADMIN="postgres"
 DST_HOST="" ; DST_PORT="5432" ; DST_ADMIN="postgres"
 DB="" ; DST_DB="" ; FORCE_ROLE=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0 ; DRY_RUN=0
+NEW_ROLE_PASSWORD="${NEW_ROLE_PASSWORD:-}"
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
 
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script, if present: ".env.pg" is
@@ -84,6 +99,7 @@ while [[ $# -gt 0 ]]; do
     --drop-existing) DROP_EXISTING=1; shift ;;
     --keep-dumps)    KEEP_DUMPS=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
+    --new-role-password) NEW_ROLE_PASSWORD="$2"; shift 2 ;;
     -h|--help)       usage 0 ;;
     *)               die "unknown argument: $1 (try --help)" ;;
   esac
@@ -150,43 +166,94 @@ case "$OWNER" in
 esac
 
 # ---------------------------------------------------------------------------
-# 2. Dump the owner role (with its encrypted password) from the source
-# ---------------------------------------------------------------------------
-info "Dumping role definition for '$OWNER' (with encrypted password)…"
-# --roles-only emits CREATE/ALTER ROLE including the SCRAM/md5 password hash.
-src_env pg_dumpall -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_ADMIN" \
-  --roles-only > "$WORKDIR/all_roles.sql"
-
-# Keep only CREATE/ALTER ROLE lines for our specific owner. Role names are
-# emitted quoted only when necessary, so match both quoted and bare forms.
-awk -v r="$OWNER" '
-  $0 ~ ("^(CREATE|ALTER) ROLE \"?" r "\"?([ ;])") { print }
-' "$WORKDIR/all_roles.sql" > "$ROLE_SQL"
-
-[[ -s "$ROLE_SQL" ]] || die "no role statements found for '$OWNER' in dump"
-info "Captured $(wc -l < "$ROLE_SQL") role statement(s) (password hash preserved)."
-
-# ---------------------------------------------------------------------------
-# 3. Recreate the role on the target
+# 2. Recreate the role on the target
+#
+# Check target existence FIRST: if the role already exists there and we're
+# not forcing a re-apply, we never need to read pg_authid on the source at
+# all. That matters because many managed Postgres services (Azure Database
+# for PostgreSQL, RDS, Cloud SQL) don't grant the admin login true
+# superuser, and pg_authid — needed to read the encrypted password hash —
+# is restricted to superusers only.
 # ---------------------------------------------------------------------------
 role_exists="$(dst_psql "SELECT 1 FROM pg_roles WHERE rolname = '${OWNER//\'/\'\'}'")"
+
 if [[ "$role_exists" == "1" && "$FORCE_ROLE" -eq 0 ]]; then
   info "Role '$OWNER' already exists on target — leaving it (and its password)"
   info "untouched. Pass --force-role to re-apply the source definition."
 else
-  if [[ "$role_exists" == "1" ]]; then
+  info "Dumping role definition for '$OWNER' (with encrypted password)…"
+  # --roles-only emits CREATE/ALTER ROLE including the SCRAM/md5 password hash.
+  ROLE_DUMP_OK=1
+  src_env pg_dumpall -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_ADMIN" \
+    --roles-only > "$WORKDIR/all_roles.sql" 2> "$WORKDIR/role_dump.err" || ROLE_DUMP_OK=0
+
+  ROLE_FALLBACK=0
+  if [[ "$ROLE_DUMP_OK" -eq 1 ]]; then
+    # Keep only CREATE/ALTER ROLE lines for our specific owner. Role names are
+    # emitted quoted only when necessary, so match both quoted and bare forms.
+    awk -v r="$OWNER" '
+      $0 ~ ("^(CREATE|ALTER) ROLE \"?" r "\"?([ ;])") { print }
+    ' "$WORKDIR/all_roles.sql" > "$ROLE_SQL"
+    [[ -s "$ROLE_SQL" ]] || die "no role statements found for '$OWNER' in dump"
+    info "Captured $(wc -l < "$ROLE_SQL") role statement(s) (password hash preserved)."
+  elif grep -q "permission denied for table pg_authid" "$WORKDIR/role_dump.err"; then
+    if [[ "$role_exists" == "1" ]]; then
+      die "cannot read '$OWNER''s password hash on the source (permission denied on pg_authid) to honor --force-role: '$SRC_ADMIN' isn't a full PostgreSQL superuser (expected on managed Postgres, e.g. Azure Database for PostgreSQL). Drop --force-role to leave the existing target role untouched, or reset its password manually."
+    fi
+    info "WARNING: '$SRC_ADMIN' cannot read pg_authid (not a full superuser — expected on"
+    info "         managed Postgres, e.g. Azure Database for PostgreSQL). Falling back to"
+    info "         creating '$OWNER' on the target with a FRESH password — NOT the source's."
+    ROLE_FALLBACK=1
+  else
+    info "pg_dumpall failed:"; cat "$WORKDIR/role_dump.err" >&2
+    die "failed to dump role definition for '$OWNER' from source"
+  fi
+
+  if [[ "$ROLE_FALLBACK" -eq 1 ]]; then
+    [[ -n "$NEW_ROLE_PASSWORD" ]] || die "role '$OWNER' does not exist on target and its password hash can't be read from the source (see warning above) — set NEW_ROLE_PASSWORD (env or .env.pg) or pass --new-role-password to choose a fresh password for it."
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would create '$OWNER' on target with a fresh password (source hash unreadable) — skipped."
+    else
+      # Attributes other than the password are visible via pg_roles (a
+      # public, password-blanked view of pg_authid), so we still carry
+      # those over even though the hash itself is unreadable.
+      read -r ROLSUPER ROLINHERIT ROLCREATEROLE ROLCREATEDB ROLCANLOGIN ROLCONNLIMIT ROLREPLICATION ROLBYPASSRLS < <(
+        src_psql "SELECT rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit, rolreplication, rolbypassrls FROM pg_roles WHERE rolname = '${OWNER//\'/\'\'}'" | tr '|' ' '
+      )
+      attrs=""
+      attrs+=$([[ "$ROLSUPER"       == "t" ]] && echo " SUPERUSER"    || echo " NOSUPERUSER")
+      attrs+=$([[ "$ROLINHERIT"     == "t" ]] && echo " INHERIT"      || echo " NOINHERIT")
+      attrs+=$([[ "$ROLCREATEROLE"  == "t" ]] && echo " CREATEROLE"   || echo " NOCREATEROLE")
+      attrs+=$([[ "$ROLCREATEDB"    == "t" ]] && echo " CREATEDB"     || echo " NOCREATEDB")
+      attrs+=$([[ "$ROLCANLOGIN"    == "t" ]] && echo " LOGIN"        || echo " NOLOGIN")
+      attrs+=$([[ "$ROLREPLICATION" == "t" ]] && echo " REPLICATION" || echo " NOREPLICATION")
+      attrs+=$([[ "$ROLBYPASSRLS"   == "t" ]] && echo " BYPASSRLS"    || echo " NOBYPASSRLS")
+      attrs+=" CONNECTION LIMIT $ROLCONNLIMIT"
+      printf 'CREATE ROLE "%s"%s PASSWORD %s;\n' \
+        "$OWNER" "$attrs" "'${NEW_ROLE_PASSWORD//\'/\'\'}'" > "$WORKDIR/role_apply.sql"
+      dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
+        -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+      info "Created '$OWNER' on target with a FRESH password — update application config to use it."
+    fi
+  elif [[ "$role_exists" == "1" ]]; then
     info "Re-applying role definition for '$OWNER' on target (--force-role)…"
     # CREATE ROLE would fail if it exists; keep only ALTER lines in that case.
     grep -E '^ALTER ROLE ' "$ROLE_SQL" > "$WORKDIR/role_apply.sql" || true
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would apply $(wc -l < "$WORKDIR/role_apply.sql") role statement(s) on target — skipped."
+    else
+      dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
+        -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+    fi
   else
     info "Creating role '$OWNER' on target…"
     cp "$ROLE_SQL" "$WORKDIR/role_apply.sql"
-  fi
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    info "[dry-run] Would apply $(wc -l < "$WORKDIR/role_apply.sql") role statement(s) on target — skipped."
-  else
-    dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
-      -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would apply $(wc -l < "$WORKDIR/role_apply.sql") role statement(s) on target — skipped."
+    else
+      dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
+        -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+    fi
   fi
 fi
 

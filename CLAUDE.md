@@ -15,11 +15,25 @@ credentials**, and carries the database's owning role (the "custom user") across
 with it — including the encrypted password hash, so the password is preserved
 without ever appearing in plaintext.
 
-Flow: connect to source as admin → auto-detect the DB owner → dump that role
-via `pg_dumpall --roles-only` (filtered to the one role) → recreate it on the
-target (skipped if it already exists, unless `--force-role`) → create the target
-DB owned by that role → `pg_dump -Fc` / `pg_restore` the contents → verify table
-counts match.
+Flow: connect to source as admin → auto-detect the DB owner → check if that role
+already exists on the target (skipped entirely if so, unless `--force-role`) →
+otherwise dump it via `pg_dumpall --roles-only` (filtered to the one role) and
+recreate it on the target → create the target DB owned by that role →
+`pg_dump -Fc` / `pg_restore` the contents → verify table counts match.
+
+**Managed Postgres (Azure Database for PostgreSQL, RDS, Cloud SQL):** reading
+the role's password hash requires `SELECT` on `pg_authid`, which is restricted
+to true superusers — managed-service admin logins usually aren't, so
+`pg_dumpall --roles-only` fails with `permission denied for table pg_authid`.
+If the role doesn't already exist on the target, the script detects this and
+falls back to creating it with a **fresh** password (other attributes —
+`SUPERUSER`/`CREATEDB`/`CREATEROLE`/etc. — are still carried over via
+`pg_roles`, which is publicly readable). Set `NEW_ROLE_PASSWORD` (env, `.env.pg`,
+or `--new-role-password`) to supply that password; the script dies with a clear
+message if it's needed but unset. If the role *does* already exist and
+`--force-role` was passed, the fallback isn't used (that would silently change
+an existing role's password) — the script dies instead, telling you to drop
+`--force-role` or reset the password manually.
 
 **Run:**
 ```bash
@@ -51,7 +65,10 @@ against a throwaway/staging pair of servers before touching production
 **Credentials:** never hardcoded. Admin passwords come from `SRC_PGPASSWORD` /
 `DST_PGPASSWORD` (falling back to `PGPASSWORD`, then `~/.pgpass`). The custom
 user's password is copied as its stored hash — the script neither reads nor sets
-it in plaintext.
+it in plaintext — except in the managed-Postgres fallback above, where
+`NEW_ROLE_PASSWORD` is set in plaintext on a newly created role because the
+source hash is unreadable; update the application's config to the new password
+in that case.
 
 ### `mysql_migrate_db.sh`
 
