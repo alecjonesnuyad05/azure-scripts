@@ -53,6 +53,14 @@
 #       --src-account <name> --src-account-key '...' \
 #       --dst-account <name> --dst-account-key '...' \
 #       [--dst-container <newname>] [--drop-existing]
+#   # or, just list what containers exist in the source account (no --container
+#   # or --dst-* needed) — useful for confirming the account name/key/RG are
+#   # right before running a real migration:
+#   ./azure_migrate_container.sh --src-account <name> --src-account-key '...' --list-src-containers
+#
+# --list-src-containers: authenticates to the source account only, lists its
+# containers (name, last-modified, lease state) and exits. No --container,
+# --dst-account, or azcopy required for this mode.
 #
 # --dry-run: authenticates both sides, reads the source blob count, checks
 # whether the destination account/container already exist, and prints
@@ -81,12 +89,12 @@ SRC_ACCOUNT="" ; SRC_RG="" ; SRC_SUB="" ; SRC_TENANT="" ; SRC_ACCOUNT_KEY=""
 DST_ACCOUNT="" ; DST_RG="" ; DST_SUB="" ; DST_TENANT="" ; DST_ACCOUNT_KEY=""
 DST_LOCATION="" ; DST_SKU="Standard_LRS"
 SAS_DURATION="14400"   # 4 hours
-DROP_EXISTING=0 ; DRY_RUN=0
+DROP_EXISTING=0 ; DRY_RUN=0 ; LIST_SRC_CONTAINERS=0
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
 
-usage() { sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script: ".env.azure" is preferred,
@@ -125,27 +133,35 @@ while [[ $# -gt 0 ]]; do
     --sas-duration)      SAS_DURATION="$2"; shift 2 ;;
     --drop-existing)     DROP_EXISTING=1; shift ;;
     --dry-run)           DRY_RUN=1; shift ;;
+    --list-src-containers) LIST_SRC_CONTAINERS=1; shift ;;
     -h|--help)           usage 0 ;;
     *)                   die "unknown argument: $1 (try --help)" ;;
   esac
 done
 
-[[ -n "$CONTAINER"   ]] || die "--container is required"
 [[ -n "$SRC_ACCOUNT" ]] || die "--src-account is required"
-[[ -n "$DST_ACCOUNT" ]] || die "--dst-account is required"
 if [[ -z "$SRC_ACCOUNT_KEY" ]]; then
   [[ -n "$SRC_RG"  ]] || die "--src-rg is required (unless --src-account-key is given)"
   [[ -n "$SRC_SUB" ]] || die "--src-subscription is required (unless --src-account-key is given)"
 fi
-if [[ -z "$DST_ACCOUNT_KEY" ]]; then
-  [[ -n "$DST_RG"  ]] || die "--dst-rg is required (unless --dst-account-key is given)"
-  [[ -n "$DST_SUB" ]] || die "--dst-subscription is required (unless --dst-account-key is given)"
-fi
-DST_CONTAINER="${DST_CONTAINER:-$CONTAINER}"
 
-for bin in az azcopy; do
-  command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found on PATH"
-done
+if [[ "$LIST_SRC_CONTAINERS" -eq 0 ]]; then
+  [[ -n "$CONTAINER"   ]] || die "--container is required"
+  [[ -n "$DST_ACCOUNT" ]] || die "--dst-account is required"
+  if [[ -z "$DST_ACCOUNT_KEY" ]]; then
+    [[ -n "$DST_RG"  ]] || die "--dst-rg is required (unless --dst-account-key is given)"
+    [[ -n "$DST_SUB" ]] || die "--dst-subscription is required (unless --dst-account-key is given)"
+  fi
+  DST_CONTAINER="${DST_CONTAINER:-$CONTAINER}"
+fi
+
+if [[ "$LIST_SRC_CONTAINERS" -eq 1 ]]; then
+  command -v az >/dev/null 2>&1 || die "'az' not found on PATH"
+else
+  for bin in az azcopy; do
+    command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found on PATH"
+  done
+fi
 
 # ---------------------------------------------------------------------------
 # Context helpers — switch the active az CLI subscription, logging in with a
@@ -169,6 +185,29 @@ use_dst() {
   fi
   az account set --subscription "$DST_SUB"
 }
+
+# ---------------------------------------------------------------------------
+# --list-src-containers: just list what's in the source account and exit —
+# no destination side, no SAS, no azcopy.
+# ---------------------------------------------------------------------------
+if [[ "$LIST_SRC_CONTAINERS" -eq 1 ]]; then
+  if [[ -n "$SRC_ACCOUNT_KEY" ]]; then
+    info "Using supplied source account key — skipping az login."
+    SRC_KEY="$SRC_ACCOUNT_KEY"
+  else
+    info "Switching to source subscription ($SRC_SUB)…"
+    use_src
+    az storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT" >/dev/null 2>&1 \
+      || die "source storage account '$SRC_ACCOUNT' not found in '$SRC_RG'"
+    SRC_KEY="$(az storage account keys list -g "$SRC_RG" -n "$SRC_ACCOUNT" \
+      --query '[0].value' -o tsv)"
+  fi
+  info "Containers in storage account '$SRC_ACCOUNT':"
+  az storage container list --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" \
+    --query "[].{name:name, lastModified:properties.lastModified, leaseState:properties.leaseState}" \
+    -o table
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # 0. Source side: locate the account/container, grant a read+list SAS

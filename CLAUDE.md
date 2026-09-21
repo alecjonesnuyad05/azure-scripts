@@ -184,8 +184,15 @@ export DST_AZURE_CLIENT_SECRET='...'   # destination SP secret
 `--help` prints full usage. `--dry-run` authenticates both sides, reads the
 source blob count, checks whether the destination account/container already
 exist, and prints exactly what would happen, without granting a SAS,
-creating an account/container, running azcopy, or deleting blobs. Shares
-`.env.azure`/`.env` and the
+creating an account/container, running azcopy, or deleting blobs.
+`--list-src-containers` authenticates to the source account only, lists its
+containers (name, last-modified, lease state) and exits — no `--container`
+or `--dst-*` needed, so it's a quick way to confirm the source account
+name/key/RG are correct before wiring up a full migration, e.g.:
+```bash
+./azure_migrate_container.sh --src-account srcstorage --src-account-key '...' --list-src-containers
+```
+Shares `.env.azure`/`.env` and the
 `SRC_AZURE_*`/`DST_AZURE_*` service-principal env vars with
 `azure_migrate_disk.sh` (same precedence: CLI flags > env file > defaults).
 Requires `az` and `azcopy` on PATH. Run under Bash, not PowerShell.
