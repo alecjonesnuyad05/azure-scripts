@@ -171,6 +171,13 @@ log into destination sub → create/reuse the destination storage account +
 container → grant a write+create SAS on it → `azcopy copy --recursive`
 (SAS-to-SAS) → verify blob counts match.
 
+Every `az` existence/access check surfaces the real `az` error (403/auth/
+network/etc.) instead of masking it behind a generic "not found" — e.g. an
+account-key request can 403 with a valid key/container if the storage
+account has "Allow storage account key access" disabled, or a firewall/
+network rule blocks the caller; the script now prints that reason instead
+of hiding it.
+
 **Run:**
 ```bash
 export SRC_AZURE_CLIENT_SECRET='...'   # source SP secret (or reuse an existing `az login`)

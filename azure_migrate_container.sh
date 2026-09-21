@@ -96,6 +96,30 @@ info() { echo ">>> $*" >&2; }
 
 usage() { sed -n '2,81p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
+# Runs `az "$@"` (discarding stdout); on failure, prints az's actual stderr
+# before dying with $1 — so a 403/auth/network error is never masked behind
+# a generic "not found" message.
+az_check() {
+  local msg="$1" err; shift
+  err="$(az "$@" 2>&1 >/dev/null)" && return 0
+  info "az error:"; printf '%s\n' "$err" | sed 's/^/         /' >&2
+  die "$msg"
+}
+
+# Same shape as a plain `az ... >/dev/null 2>&1` existence check (returns
+# 0/1), but if the failure looks like an auth/network problem rather than a
+# genuine "not found", warns loudly instead of silently treating it as
+# "doesn't exist yet" (which would otherwise go on to attempt a create).
+az_exists() {
+  local err
+  err="$(az "$@" 2>&1 >/dev/null)" && return 0
+  if printf '%s' "$err" | grep -qiE 'authorizationfailed|403|forbidden|accountiskeydisabled|keybasedauthenticationnotpermitted'; then
+    info "WARNING: az reported an authorization/network error, not just \"not found\":"
+    printf '%s\n' "$err" | sed 's/^/         /' >&2
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script: ".env.azure" is preferred,
 # else ".env" (override with ENV_FILE=...), shared with azure_migrate_disk.sh.
@@ -197,8 +221,8 @@ if [[ "$LIST_SRC_CONTAINERS" -eq 1 ]]; then
   else
     info "Switching to source subscription ($SRC_SUB)…"
     use_src
-    az storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT" >/dev/null 2>&1 \
-      || die "source storage account '$SRC_ACCOUNT' not found in '$SRC_RG'"
+    az_check "source storage account '$SRC_ACCOUNT' not accessible in '$SRC_RG' (see az error above)" \
+      storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT"
     SRC_KEY="$(az storage account keys list -g "$SRC_RG" -n "$SRC_ACCOUNT" \
       --query '[0].value' -o tsv)"
   fi
@@ -218,15 +242,14 @@ if [[ -n "$SRC_ACCOUNT_KEY" ]]; then
 else
   info "Switching to source subscription ($SRC_SUB)…"
   use_src
-  az storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT" >/dev/null 2>&1 \
-    || die "source storage account '$SRC_ACCOUNT' not found in '$SRC_RG'"
+  az_check "source storage account '$SRC_ACCOUNT' not accessible in '$SRC_RG' (see az error above)" \
+    storage account show -g "$SRC_RG" -n "$SRC_ACCOUNT"
   SRC_KEY="$(az storage account keys list -g "$SRC_RG" -n "$SRC_ACCOUNT" \
     --query '[0].value' -o tsv)"
 fi
 
-az storage container show --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" \
-  -n "$CONTAINER" >/dev/null 2>&1 \
-  || die "source container '$CONTAINER' not found in account '$SRC_ACCOUNT'"
+az_check "source container '$CONTAINER' not accessible in account '$SRC_ACCOUNT' (see az error above)" \
+  storage container show --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" -n "$CONTAINER"
 
 SRC_COUNT="$(az storage blob list --account-name "$SRC_ACCOUNT" --account-key "$SRC_KEY" \
   -c "$CONTAINER" --num-results '*' --query 'length(@)' -o tsv)"
@@ -243,10 +266,11 @@ else
   info "Switching to destination subscription ($DST_SUB)…"
   use_dst
 
-  az group show -g "$DST_RG" >/dev/null 2>&1 || die "destination resource group '$DST_RG' does not exist"
+  az_check "destination resource group '$DST_RG' does not exist or is not accessible (see az error above)" \
+    group show -g "$DST_RG"
 
   DST_ACCOUNT_EXISTS=1
-  if ! az storage account show -g "$DST_RG" -n "$DST_ACCOUNT" >/dev/null 2>&1; then
+  if ! az_exists storage account show -g "$DST_RG" -n "$DST_ACCOUNT"; then
     DST_ACCOUNT_EXISTS=0
     [[ -n "$DST_LOCATION" ]] || die "destination storage account '$DST_ACCOUNT' does not exist — pass --dst-location to create it"
     if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -267,8 +291,8 @@ else
     --query '[0].value' -o tsv)"
 fi
 
-if az storage container show --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
-    -n "$DST_CONTAINER" >/dev/null 2>&1; then
+if az_exists storage container show --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+    -n "$DST_CONTAINER"; then
   if [[ "$DROP_EXISTING" -eq 1 ]]; then
     if [[ "$DRY_RUN" -eq 1 ]]; then
       info "[dry-run] Would delete existing blobs in destination container '$DST_CONTAINER' (--drop-existing)."
