@@ -23,7 +23,13 @@
 #   ./pg_migrate_db.sh --db <dbname> \
 #       --src-host H --src-admin postgres [--src-port 5432] \
 #       --dst-host H --dst-admin postgres [--dst-port 5432] \
-#       [--dst-db <newname>] [--force-role] [--drop-existing] [--keep-dumps]
+#       [--dst-db <newname>] [--force-role] [--drop-existing] [--keep-dumps] \
+#       [--dry-run]
+#
+# --dry-run: runs every read-only check (connectivity, DB existence, owner
+# detection, role-dump, whether the role/target DB already exist) and prints
+# exactly what would happen, but performs no writes on either server — no
+# role created/altered, no database created/dropped, no dump/restore.
 #
 # Passwords (set whichever apply before running):
 #   export SRC_PGPASSWORD='...'   # source admin password
@@ -37,12 +43,12 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SRC_HOST="" ; SRC_PORT="5432" ; SRC_ADMIN="postgres"
 DST_HOST="" ; DST_PORT="5432" ; DST_ADMIN="postgres"
-DB="" ; DST_DB="" ; FORCE_ROLE=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0
+DB="" ; DST_DB="" ; FORCE_ROLE=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0 ; DRY_RUN=0
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script, if present: ".env.pg" is
@@ -77,6 +83,7 @@ while [[ $# -gt 0 ]]; do
     --force-role)    FORCE_ROLE=1; shift ;;
     --drop-existing) DROP_EXISTING=1; shift ;;
     --keep-dumps)    KEEP_DUMPS=1; shift ;;
+    --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       usage 0 ;;
     *)               die "unknown argument: $1 (try --help)" ;;
   esac
@@ -86,6 +93,7 @@ done
 [[ -n "$SRC_HOST" ]] || die "--src-host is required"
 [[ -n "$DST_HOST" ]] || die "--dst-host is required"
 DST_DB="${DST_DB:-$DB}"
+[[ "$DRY_RUN" -eq 1 ]] && info "DRY RUN — no changes will be made on source or target."
 
 for bin in psql pg_dump pg_dumpall pg_restore; do
   command -v "$bin" >/dev/null 2>&1 || die "'$bin' not found on PATH"
@@ -174,8 +182,12 @@ else
     info "Creating role '$OWNER' on target…"
     cp "$ROLE_SQL" "$WORKDIR/role_apply.sql"
   fi
-  dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
-    -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "[dry-run] Would apply $(wc -l < "$WORKDIR/role_apply.sql") role statement(s) on target — skipped."
+  else
+    dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
+      -d postgres -v ON_ERROR_STOP=1 -f "$WORKDIR/role_apply.sql"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -184,14 +196,25 @@ fi
 dst_exists="$(dst_psql "SELECT 1 FROM pg_database WHERE datname = '${DST_DB//\'/\'\'}'")"
 if [[ "$dst_exists" == "1" ]]; then
   if [[ "$DROP_EXISTING" -eq 1 ]]; then
-    info "Dropping existing target database '$DST_DB'…"
-    dst_psql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DST_DB//\'/\'\'}' AND pid <> pg_backend_pid()" >/dev/null || true
-    dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
-      -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE \"$DST_DB\""
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would terminate connections to and drop existing target database '$DST_DB' (--drop-existing)."
+    else
+      info "Dropping existing target database '$DST_DB'…"
+      dst_psql "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DST_DB//\'/\'\'}' AND pid <> pg_backend_pid()" >/dev/null || true
+      dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
+        -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE \"$DST_DB\""
+    fi
     dst_exists="0"
   else
     die "target database '$DST_DB' already exists (use --drop-existing to replace)"
   fi
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "[dry-run] Would create target database '$DST_DB' owned by '$OWNER' — skipped."
+  info "[dry-run] Would pg_dump source database '$DB' and pg_restore it into '$DST_DB' — skipped."
+  info "DRY RUN complete. No changes were made on source or target."
+  exit 0
 fi
 
 info "Creating target database '$DST_DB' owned by '$OWNER'…"

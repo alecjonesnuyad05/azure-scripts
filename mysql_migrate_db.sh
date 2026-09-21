@@ -29,7 +29,14 @@
 #   ./mysql_migrate_db.sh --db <dbname> \
 #       --src-host H --src-admin root [--src-port 3306] \
 #       --dst-host H --dst-admin root [--dst-port 3306] \
-#       [--dst-db <newname>] [--force-user] [--drop-existing] [--keep-dumps]
+#       [--dst-db <newname>] [--force-user] [--drop-existing] [--keep-dumps] \
+#       [--dry-run]
+#
+# --dry-run: runs every read-only check (connectivity, DB existence, which
+# users hold privileges on it, whether the target DB/users already exist)
+# and prints exactly what would happen, but performs no writes on either
+# server — no user created/altered, no grants replayed, no database
+# created/dropped, no dump/load.
 #
 # Passwords (set whichever apply before running, or put them in .env):
 #   export SRC_MYSQL_PWD='...'   # source admin password
@@ -42,7 +49,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SRC_HOST="" ; SRC_PORT="3306" ; SRC_ADMIN="root"
 DST_HOST="" ; DST_PORT="3306" ; DST_ADMIN="root"
-DB="" ; DST_DB="" ; FORCE_USER=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0
+DB="" ; DST_DB="" ; FORCE_USER=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0 ; DRY_RUN=0
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
@@ -79,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --force-user)    FORCE_USER=1; shift ;;
     --drop-existing) DROP_EXISTING=1; shift ;;
     --keep-dumps)    KEEP_DUMPS=1; shift ;;
+    --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       usage 0 ;;
     *)               die "unknown argument: $1 (try --help)" ;;
   esac
@@ -88,6 +96,7 @@ done
 [[ -n "$SRC_HOST" ]] || die "--src-host is required"
 [[ -n "$DST_HOST" ]] || die "--dst-host is required"
 DST_DB="${DST_DB:-$DB}"
+[[ "$DRY_RUN" -eq 1 ]] && info "DRY RUN — no changes will be made on source or target."
 
 # Resolve client binaries (MySQL or MariaDB naming).
 MYSQL_BIN="$(command -v mysql || command -v mariadb || true)"
@@ -170,13 +179,21 @@ migrate_user() { # $1=user $2=host
   if [[ "$exists_t" == "1" && "$FORCE_USER" -eq 0 ]]; then
     info "  = user $u@$h exists on target; leaving password/auth untouched (--force-user to re-apply)"
   elif [[ "$exists_t" == "1" ]]; then
-    info "  ~ re-applying auth for $u@$h (--force-user)"
     # CREATE USER ... -> ALTER USER ... keeps the same IDENTIFIED WITH/AS hash.
     apply="$(printf "%s" "$create_stmt" | sed 's/^CREATE USER /ALTER USER /')"
-    dst_q "$apply;"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "  [dry-run] would re-apply auth for $u@$h (--force-user) — skipped"
+    else
+      info "  ~ re-applying auth for $u@$h (--force-user)"
+      dst_q "$apply;"
+    fi
   else
-    info "  + creating user $u@$h (password hash preserved)"
-    dst_q "$create_stmt;"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "  [dry-run] would create user $u@$h (password hash preserved) — skipped"
+    else
+      info "  + creating user $u@$h (password hash preserved)"
+      dst_q "$create_stmt;"
+    fi
   fi
 
   # Replay grants that reference THIS database (plus the USAGE identity line).
@@ -189,7 +206,11 @@ migrate_user() { # $1=user $2=host
       if [[ "$DST_DB" != "$DB" ]]; then
         line="${line//\`$DB\`./\`$DST_DB\`.}"
       fi
-      dst_q "$line;" || info "  ! grant failed (continuing): $line"
+      if [[ "$DRY_RUN" -eq 1 ]]; then
+        info "  [dry-run] would replay grant: $line"
+      else
+        dst_q "$line;" || info "  ! grant failed (continuing): $line"
+      fi
     fi
   done <<< "$grants"
 }
@@ -212,11 +233,22 @@ CHARSET="${CHARSET:-utf8mb4}"
 dst_exists="$(dst_q "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(sql_quote "$DST_DB")'")"
 if [[ "$dst_exists" == "1" ]]; then
   if [[ "$DROP_EXISTING" -eq 1 ]]; then
-    info "Dropping existing target database '$DST_DB'…"
-    dst_q "DROP DATABASE \`$DST_DB\`"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would drop existing target database '$DST_DB' (--drop-existing)."
+    else
+      info "Dropping existing target database '$DST_DB'…"
+      dst_q "DROP DATABASE \`$DST_DB\`"
+    fi
   else
     die "target database '$DST_DB' already exists (use --drop-existing to replace)"
   fi
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "[dry-run] Would create target database '$DST_DB' (CHARSET $CHARSET, COLLATE ${COLLATION:-default}) — skipped."
+  info "[dry-run] Would mysqldump source database '$DB' and load it into '$DST_DB' — skipped."
+  info "DRY RUN complete. No changes were made on source or target."
+  exit 0
 fi
 
 info "Creating target database '$DST_DB' (CHARSET $CHARSET, COLLATE ${COLLATION:-default})…"

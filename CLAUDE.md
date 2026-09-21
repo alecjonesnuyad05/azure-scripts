@@ -28,9 +28,12 @@ export DST_PGPASSWORD='...'   # target admin password
 ./pg_migrate_db.sh --db mydb \
     --src-host born1 --src-admin postgres \
     --dst-host born3 --dst-admin postgres \
-    [--dst-db newname] [--force-role] [--drop-existing] [--keep-dumps]
+    [--dst-db newname] [--force-role] [--drop-existing] [--keep-dumps] [--dry-run]
 ```
-`--help` prints full usage.
+`--help` prints full usage. `--dry-run` runs all the read-only checks (connectivity,
+DB existence, owner detection, role dump, whether the role/target DB already
+exist) and prints exactly what would happen, without creating/altering any
+role or database and without dumping/restoring anything.
 
 **Config via env file:** on startup the script auto-loads `.env.pg` (preferred)
 or `.env` from its own directory (override with `ENV_FILE=/path/file`). Any
@@ -68,9 +71,13 @@ export DST_MYSQL_PWD='...'
 ./mysql_migrate_db.sh --db mydb \
     --src-host born1 --src-admin root \
     --dst-host born3 --dst-admin root \
-    [--dst-db newname] [--force-user] [--drop-existing] [--keep-dumps]
+    [--dst-db newname] [--force-user] [--drop-existing] [--keep-dumps] [--dry-run]
 ```
-`--help` prints full usage. Auto-loads `.env.mysql` (preferred) or `.env` from
+`--help` prints full usage. `--dry-run` runs all the read-only checks
+(connectivity, DB existence, which users hold privileges on it, whether the
+target DB/users already exist) and prints exactly what would happen, without
+creating/altering any user, replaying grants, or creating/dropping/loading
+the database. Auto-loads `.env.mysql` (preferred) or `.env` from
 its own directory; copy `.env.mysql.example` to `.env.mysql` to start.
 Requires the `mysql`/`mariadb` client and `mysqldump`/`mariadb-dump` on PATH
 (both naming schemes are auto-detected). Passwords are written to short-lived
@@ -105,9 +112,13 @@ export DST_AZURE_CLIENT_SECRET='...'   # destination SP secret
     --src-rg my-src-rg --src-subscription <src-sub-id> \
     --dst-rg my-dst-rg --dst-subscription <dst-sub-id> \
     [--dst-disk newname] [--dst-location westeurope] [--sku Premium_LRS] \
-    [--staging-account name] [--drop-existing] [--keep-staging]
+    [--staging-account name] [--drop-existing] [--keep-staging] [--dry-run]
 ```
-`--help` prints full usage.
+`--help` prints full usage. `--dry-run` logs into both sides, reads the
+source disk's size/sku/location, checks whether the destination disk
+already exists, and prints exactly what would happen, without creating a
+snapshot/SAS/staging account, running azcopy, or creating/deleting the
+destination disk.
 
 **Config via env file:** on startup the script auto-loads `.env.azure`
 (preferred) or `.env` from its own directory (override with
@@ -151,9 +162,13 @@ export DST_AZURE_CLIENT_SECRET='...'   # destination SP secret
     --src-account srcstorage --src-rg my-src-rg --src-subscription <src-sub-id> \
     --dst-account dststorage --dst-rg my-dst-rg --dst-subscription <dst-sub-id> \
     [--dst-container newname] [--dst-location westeurope] [--dst-sku Standard_LRS] \
-    [--drop-existing]
+    [--drop-existing] [--dry-run]
 ```
-`--help` prints full usage. Shares `.env.azure`/`.env` and the
+`--help` prints full usage. `--dry-run` authenticates both sides, reads the
+source blob count, checks whether the destination account/container already
+exist, and prints exactly what would happen, without granting a SAS,
+creating an account/container, running azcopy, or deleting blobs. Shares
+`.env.azure`/`.env` and the
 `SRC_AZURE_*`/`DST_AZURE_*` service-principal env vars with
 `azure_migrate_disk.sh` (same precedence: CLI flags > env file > defaults).
 Requires `az` and `azcopy` on PATH. Run under Bash, not PowerShell.

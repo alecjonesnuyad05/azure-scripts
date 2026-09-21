@@ -47,12 +47,17 @@
 #       --src-account <name> --src-rg <rg> --src-subscription <id> [--src-tenant <id>] \
 #       --dst-account <name> --dst-rg <rg> --dst-subscription <id> [--dst-tenant <id>] \
 #       [--dst-container <newname>] [--dst-location <region>] [--dst-sku <sku>] \
-#       [--sas-duration <seconds>] [--drop-existing]
+#       [--sas-duration <seconds>] [--drop-existing] [--dry-run]
 #   # or, skipping az login on one/both sides:
 #   ./azure_migrate_container.sh --container <name> \
 #       --src-account <name> --src-account-key '...' \
 #       --dst-account <name> --dst-account-key '...' \
 #       [--dst-container <newname>] [--drop-existing]
+#
+# --dry-run: authenticates both sides, reads the source blob count, checks
+# whether the destination account/container already exist, and prints
+# exactly what would happen — but grants no SAS, creates no account/
+# container, runs no azcopy, and deletes no blobs.
 #
 # Service principal creds (set whichever side needs a fresh login, or put
 # them in .env.azure):
@@ -76,12 +81,12 @@ SRC_ACCOUNT="" ; SRC_RG="" ; SRC_SUB="" ; SRC_TENANT="" ; SRC_ACCOUNT_KEY=""
 DST_ACCOUNT="" ; DST_RG="" ; DST_SUB="" ; DST_TENANT="" ; DST_ACCOUNT_KEY=""
 DST_LOCATION="" ; DST_SKU="Standard_LRS"
 SAS_DURATION="14400"   # 4 hours
-DROP_EXISTING=0
+DROP_EXISTING=0 ; DRY_RUN=0
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
 
-usage() { sed -n '2,67p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script: ".env.azure" is preferred,
@@ -119,6 +124,7 @@ while [[ $# -gt 0 ]]; do
     --dst-sku)           DST_SKU="$2"; shift 2 ;;
     --sas-duration)      SAS_DURATION="$2"; shift 2 ;;
     --drop-existing)     DROP_EXISTING=1; shift ;;
+    --dry-run)           DRY_RUN=1; shift ;;
     -h|--help)           usage 0 ;;
     *)                   die "unknown argument: $1 (try --help)" ;;
   esac
@@ -187,12 +193,6 @@ SRC_COUNT="$(az storage blob list --account-name "$SRC_ACCOUNT" --account-key "$
   -c "$CONTAINER" --num-results '*' --query 'length(@)' -o tsv)"
 info "Source container '$CONTAINER' has $SRC_COUNT blob(s)."
 
-EXPIRY="$(date -u -d "+${SAS_DURATION} seconds" '+%Y-%m-%dT%H:%MZ' 2>/dev/null \
-  || date -u -v"+${SAS_DURATION}S" '+%Y-%m-%dT%H:%MZ')"
-SRC_SAS_TOKEN="$(az storage container generate-sas --account-name "$SRC_ACCOUNT" \
-  --account-key "$SRC_KEY" -n "$CONTAINER" --permissions rl --expiry "$EXPIRY" -o tsv)"
-SRC_SAS_URL="https://${SRC_ACCOUNT}.blob.core.windows.net/${CONTAINER}?${SRC_SAS_TOKEN}"
-
 # ---------------------------------------------------------------------------
 # 1. Destination side: storage account + container + write SAS
 # ---------------------------------------------------------------------------
@@ -206,11 +206,23 @@ else
 
   az group show -g "$DST_RG" >/dev/null 2>&1 || die "destination resource group '$DST_RG' does not exist"
 
+  DST_ACCOUNT_EXISTS=1
   if ! az storage account show -g "$DST_RG" -n "$DST_ACCOUNT" >/dev/null 2>&1; then
+    DST_ACCOUNT_EXISTS=0
     [[ -n "$DST_LOCATION" ]] || die "destination storage account '$DST_ACCOUNT' does not exist — pass --dst-location to create it"
-    info "Creating destination storage account '$DST_ACCOUNT'…"
-    az storage account create -g "$DST_RG" -n "$DST_ACCOUNT" \
-      -l "$DST_LOCATION" --sku "$DST_SKU" --kind StorageV2 -o none
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would create destination storage account '$DST_ACCOUNT' ($DST_SKU, $DST_LOCATION) — skipped."
+    else
+      info "Creating destination storage account '$DST_ACCOUNT'…"
+      az storage account create -g "$DST_RG" -n "$DST_ACCOUNT" \
+        -l "$DST_LOCATION" --sku "$DST_SKU" --kind StorageV2 -o none
+    fi
+  fi
+  if [[ "$DRY_RUN" -eq 1 && "$DST_ACCOUNT_EXISTS" -eq 0 ]]; then
+    info "[dry-run] Would copy $SRC_COUNT blob(s) from '$SRC_ACCOUNT/$CONTAINER' into new account/container"
+    info "[dry-run] '$DST_ACCOUNT/$DST_CONTAINER' — skipped (no account key available for further checks)."
+    info "DRY RUN complete. No changes were made in either subscription."
+    exit 0
   fi
   DST_KEY="$(az storage account keys list -g "$DST_RG" -n "$DST_ACCOUNT" \
     --query '[0].value' -o tsv)"
@@ -219,15 +231,35 @@ fi
 if az storage container show --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
     -n "$DST_CONTAINER" >/dev/null 2>&1; then
   if [[ "$DROP_EXISTING" -eq 1 ]]; then
-    info "Deleting existing blobs in destination container '$DST_CONTAINER'…"
-    az storage blob delete-batch --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
-      -s "$DST_CONTAINER" -o none
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      info "[dry-run] Would delete existing blobs in destination container '$DST_CONTAINER' (--drop-existing)."
+    else
+      info "Deleting existing blobs in destination container '$DST_CONTAINER'…"
+      az storage blob delete-batch --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+        -s "$DST_CONTAINER" -o none
+    fi
   fi
 else
-  info "Creating destination container '$DST_CONTAINER'…"
-  az storage container create --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
-    -n "$DST_CONTAINER" -o none
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "[dry-run] Would create destination container '$DST_CONTAINER' — skipped."
+  else
+    info "Creating destination container '$DST_CONTAINER'…"
+    az storage container create --account-name "$DST_ACCOUNT" --account-key "$DST_KEY" \
+      -n "$DST_CONTAINER" -o none
+  fi
 fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  info "[dry-run] Would copy $SRC_COUNT blob(s) from '$SRC_ACCOUNT/$CONTAINER' to '$DST_ACCOUNT/$DST_CONTAINER' via azcopy — skipped."
+  info "DRY RUN complete. No changes were made in either subscription."
+  exit 0
+fi
+
+EXPIRY="$(date -u -d "+${SAS_DURATION} seconds" '+%Y-%m-%dT%H:%MZ' 2>/dev/null \
+  || date -u -v"+${SAS_DURATION}S" '+%Y-%m-%dT%H:%MZ')"
+SRC_SAS_TOKEN="$(az storage container generate-sas --account-name "$SRC_ACCOUNT" \
+  --account-key "$SRC_KEY" -n "$CONTAINER" --permissions rl --expiry "$EXPIRY" -o tsv)"
+SRC_SAS_URL="https://${SRC_ACCOUNT}.blob.core.windows.net/${CONTAINER}?${SRC_SAS_TOKEN}"
 
 DST_SAS_TOKEN="$(az storage container generate-sas --account-name "$DST_ACCOUNT" \
   --account-key "$DST_KEY" -n "$DST_CONTAINER" --permissions cwl --expiry "$EXPIRY" -o tsv)"
