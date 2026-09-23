@@ -110,6 +110,21 @@ az_check() {
   die "$msg"
 }
 
+# Counts entries under a share SAS URL recursively via `azcopy list` (az
+# CLI's share listing is shallow). Counts every "Content Length:" line, which
+# includes directories as well as files — fine for comparing source vs.
+# destination, since both are counted the same way. On failure, prints
+# azcopy's actual output and returns non-zero instead of silently yielding 0.
+# The SAS needs read + list (azcopy list does GetProperties calls).
+count_share_entries() {
+  local url="$1" out
+  if ! out="$(azcopy list "$url" 2>&1)"; then
+    info "azcopy list error:"; printf '%s\n' "$out" | sed 's/^/         /' >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | grep -ic 'Content Length:' || true
+}
+
 # Same shape as a plain `az ... >/dev/null 2>&1` existence check (returns
 # 0/1), but if the failure looks like an auth/network problem rather than a
 # genuine "not found", warns loudly instead of silently treating it as
@@ -264,8 +279,9 @@ SRC_SAS_TOKEN="$(az storage share generate-sas --account-name "$SRC_ACCOUNT" \
 SRC_SAS_URL="https://${SRC_ACCOUNT}.file.core.windows.net/${SHARE}?${SRC_SAS_TOKEN}"
 
 info "Counting source share's files recursively (azcopy list)…"
-SRC_COUNT="$(azcopy list "$SRC_SAS_URL" 2>/dev/null | grep -ic 'Content Length:' || true)"
-info "Source share '$SHARE' has $SRC_COUNT file(s)."
+SRC_COUNT="$(count_share_entries "$SRC_SAS_URL")" \
+  || die "could not list source share '$SHARE' (see azcopy error above)"
+info "Source share '$SHARE' has $SRC_COUNT entries (files + directories)."
 
 # ---------------------------------------------------------------------------
 # 1. Destination side: storage account + share + write SAS
@@ -349,8 +365,14 @@ azcopy copy "$SRC_SAS_URL" "$DST_SAS_URL" --recursive=true
 # 3. Verification
 # ---------------------------------------------------------------------------
 info "Counting destination share's files recursively (azcopy list)…"
-DST_COUNT="$(azcopy list "$DST_SAS_URL" 2>/dev/null | grep -ic 'Content Length:' || true)"
-info "File count — source: $SRC_COUNT, destination: $DST_COUNT"
+# Separate read+list SAS for verification — the copy SAS is deliberately
+# write-only (cwl), and azcopy list needs read.
+DST_VERIFY_SAS_TOKEN="$(az storage share generate-sas --account-name "$DST_ACCOUNT" \
+  --account-key "$DST_KEY" -n "$DST_SHARE" --permissions rl --expiry "$EXPIRY" -o tsv)"
+DST_VERIFY_URL="https://${DST_ACCOUNT}.file.core.windows.net/${DST_SHARE}?${DST_VERIFY_SAS_TOKEN}"
+DST_COUNT="$(count_share_entries "$DST_VERIFY_URL")" \
+  || die "copy finished but could not list destination share '$DST_SHARE' to verify (see azcopy error above)"
+info "Entry count (files + directories) — source: $SRC_COUNT, destination: $DST_COUNT"
 if [[ "$SRC_COUNT" == "$DST_COUNT" ]]; then
   info "Migration complete. Share '$DST_SHARE' populated in account '$DST_ACCOUNT'."
 else

@@ -232,7 +232,12 @@ adapted for Azure Files' hierarchical directories instead of a flat blob
 namespace. `az storage file list` only lists one directory level at a time
 (no recursive flag), so file counts (pre-copy source count, post-copy
 verification) are done via `azcopy list` against a SAS URL instead, counting
-`Content Length:` entries recursively.
+`Content Length:` entries recursively. That count includes directories as
+well as files, so it won't match azcopy's "File Transfers" number. It's only
+used to compare source against destination. `azcopy list` needs **read+list**
+on the share, so verification uses its own `rl` SAS rather than the write-only
+(`cwl`) copy SAS. If listing fails, azcopy's error is printed rather than
+being counted as 0.
 
 Flow: log into source sub → grant a read+list SAS on the source share, count
 its files via `azcopy list` → log into destination sub → create/reuse the
