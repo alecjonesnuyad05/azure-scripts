@@ -135,7 +135,18 @@ dst_psql() {  # $1 = sql, $2 = db (default postgres)
 # Working directory for dumps
 # ---------------------------------------------------------------------------
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/pgmig.${DB}.XXXXXX")"
-cleanup() { [[ "$KEEP_DUMPS" -eq 1 ]] || rm -rf "$WORKDIR"; }
+# On failure (non-zero exit) keep the *.log files so they can be inspected,
+# but still remove dumps/role SQL unless --keep-dumps was given.
+cleanup() {
+  local rc=$?
+  [[ "$KEEP_DUMPS" -eq 1 ]] && return
+  if [[ $rc -ne 0 ]] && compgen -G "$WORKDIR/*.log" >/dev/null; then
+    find "$WORKDIR" -type f ! -name '*.log' -delete
+    info "Logs kept for inspection in $WORKDIR"
+  else
+    rm -rf "$WORKDIR"
+  fi
+}
 trap cleanup EXIT
 ROLE_SQL="$WORKDIR/role.sql"
 DB_DUMP="$WORKDIR/${DB}.dump"
@@ -289,6 +300,17 @@ dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
   -d postgres -v ON_ERROR_STOP=1 \
   -c "CREATE DATABASE \"$DST_DB\" OWNER \"$OWNER\""
 
+# The dump's ALTER ... OWNER TO / SET SESSION AUTHORIZATION statements need
+# the restoring admin to be a member of the owner role. A true superuser
+# always is; a managed-Postgres admin (Azure, RDS, …) isn't — and on PG16+
+# creating a role no longer makes you a member of it — so without this the
+# restore fails for every object owned by '$OWNER'.
+if [[ "$DST_ADMIN" != "$OWNER" ]]; then
+  info "Granting '$OWNER' to '$DST_ADMIN' so the restore can assign object ownership…"
+  dst_psql "GRANT \"$OWNER\" TO \"$DST_ADMIN\"" >/dev/null \
+    || info "WARNING: could not grant '$OWNER' to '$DST_ADMIN'; owned objects may fail to restore."
+fi
+
 # ---------------------------------------------------------------------------
 # 5. Dump + restore the database contents
 # ---------------------------------------------------------------------------
@@ -303,19 +325,28 @@ info "Restoring into target database '$DST_DB'…"
 # pg_restore continues past non-fatal errors by default; we log them.
 dst_env pg_restore -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" \
   -d "$DST_DB" "$DB_DUMP" 2> "$WORKDIR/restore.log" || {
-    info "pg_restore reported issues; tail of log:"
-    tail -n 20 "$WORKDIR/restore.log" >&2
+    # Managed Postgres puts custom ACLs on pg_catalog columns, which pg_dump
+    # carries over and the target refuses ("no privileges were granted for
+    # column ... of relation pg_..."). Those are harmless noise — show the
+    # real errors instead of a tail full of them.
+    noise="$(grep -c 'no privileges were granted for column' "$WORKDIR/restore.log" || true)"
+    info "pg_restore reported issues (ignoring $noise harmless pg_catalog ACL warning(s)). Errors:"
+    grep -iE 'error' "$WORKDIR/restore.log" | head -n 40 >&2 || true
   }
 
 # ---------------------------------------------------------------------------
 # 6. Post-migration verification
 # ---------------------------------------------------------------------------
-src_tables="$(src_env psql -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_ADMIN" -d "$DB" -tAqX \
-  -c "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')")"
-dst_tables="$(dst_env psql -h "$DST_HOST" -p "$DST_PORT" -U "$DST_ADMIN" -d "$DST_DB" -tAqX \
-  -c "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')")"
+# Count from pg_class, not information_schema.tables: the latter only lists
+# tables the *querying* user has privileges on, so a non-superuser admin
+# would see different numbers on each side even for identical databases.
+COUNT_SQL="SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind IN ('r','p','v','m','f')
+    AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'"
+src_tables="$(src_env psql -h "$SRC_HOST" -p "$SRC_PORT" -U "$SRC_ADMIN" -d "$DB" -tAqX -c "$COUNT_SQL")"
+dst_tables="$(dst_psql "$COUNT_SQL" "$DST_DB")"
 
-info "Table count — source: $src_tables, target: $dst_tables"
+info "Table/view count — source: $src_tables, target: $dst_tables"
 if [[ "$src_tables" == "$dst_tables" ]]; then
   info "Migration complete. Database '$DST_DB' owned by '$OWNER' on $DST_HOST."
 else

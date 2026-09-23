@@ -35,6 +35,17 @@ message if it's needed but unset. If the role *does* already exist and
 an existing role's password) — the script dies instead, telling you to drop
 `--force-role` or reset the password manually.
 
+Also for managed Postgres: before restoring, the script runs `GRANT <owner> TO
+<dst-admin>`. The dump's ownership statements need the restoring admin to be
+a member of the owner role, and a non-superuser admin isn't, especially on
+PG16+. Without the grant, every object owned by that role fails to restore.
+pg_restore's "no privileges were granted for column … of relation pg_…"
+warnings come from the provider's own pg_catalog ACLs. They're harmless and
+are filtered out, so only the real errors are printed. Table verification
+counts from `pg_class`, not `information_schema.tables`, which only lists
+tables the querying user has privileges on. On failure, the `*.log` files in
+the work directory are kept; the dump files are still removed.
+
 **Run:**
 ```bash
 export SRC_PGPASSWORD='...'   # source admin password (or use ~/.pgpass)
