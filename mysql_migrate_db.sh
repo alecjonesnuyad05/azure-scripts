@@ -30,7 +30,12 @@
 #       --src-host H --src-admin root [--src-port 3306] \
 #       --dst-host H --dst-admin root [--dst-port 3306] \
 #       [--dst-db <newname>] [--force-user] [--drop-existing] [--keep-dumps] \
-#       [--dry-run]
+#       [--skip-data t1,t2 ...] [--dry-run]
+#
+# --skip-data <tables>: comma-separated list (repeatable) of tables whose
+# DATA is not copied — the table is still created on the target with its
+# full structure (columns, indexes, triggers), just empty. Useful for big
+# log/session/cache/audit tables. Also settable as SKIP_DATA_TABLES in .env.
 #
 # --dry-run: runs every read-only check (connectivity, DB existence, which
 # users hold privileges on it, whether the target DB/users already exist)
@@ -50,11 +55,12 @@ set -euo pipefail
 SRC_HOST="" ; SRC_PORT="3306" ; SRC_ADMIN="root"
 DST_HOST="" ; DST_PORT="3306" ; DST_ADMIN="root"
 DB="" ; DST_DB="" ; FORCE_USER=0 ; DROP_EXISTING=0 ; KEEP_DUMPS=0 ; DRY_RUN=0
+SKIP_DATA_TABLES="${SKIP_DATA_TABLES:-}" ; SKIP_DATA_CLI=""
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo ">>> $*" >&2; }
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------------------------------------------------------------------------
 # Load an env file sitting next to this script: ".env.mysql" is preferred, else
@@ -86,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --force-user)    FORCE_USER=1; shift ;;
     --drop-existing) DROP_EXISTING=1; shift ;;
     --keep-dumps)    KEEP_DUMPS=1; shift ;;
+    --skip-data)     SKIP_DATA_CLI="${SKIP_DATA_CLI:+$SKIP_DATA_CLI,}$2"; shift 2 ;;
     --dry-run)       DRY_RUN=1; shift ;;
     -h|--help)       usage 0 ;;
     *)               die "unknown argument: $1 (try --help)" ;;
@@ -96,6 +103,7 @@ done
 [[ -n "$SRC_HOST" ]] || die "--src-host is required"
 [[ -n "$DST_HOST" ]] || die "--dst-host is required"
 DST_DB="${DST_DB:-$DB}"
+SKIP_DATA_TABLES="${SKIP_DATA_CLI:-$SKIP_DATA_TABLES}"   # CLI replaces env file
 [[ "$DRY_RUN" -eq 1 ]] && info "DRY RUN — no changes will be made on source or target."
 
 # Resolve client binaries (MySQL or MariaDB naming).
@@ -112,6 +120,7 @@ cleanup() { [[ "$KEEP_DUMPS" -eq 1 ]] || rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 SRC_CNF="$WORKDIR/src.cnf" ; DST_CNF="$WORKDIR/dst.cnf"
 DB_DUMP="$WORKDIR/${DB}.sql"
+SCHEMA_ONLY_DUMP="$WORKDIR/${DB}.skipdata-schema.sql"
 
 write_cnf() { # $1=file $2=host $3=port $4=user $5=password
   umask 077
@@ -143,6 +152,19 @@ dst_q "SELECT 1" >/dev/null || die "cannot connect to target"
 DBQ="$(sql_quote "$DB")"
 exists="$(src_q "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$DBQ'")"
 [[ "$exists" == "1" ]] || die "database '$DB' does not exist on source"
+
+# Tables whose data is skipped (structure only). Each must be a base table.
+SKIP_TABLES=()
+if [[ -n "$SKIP_DATA_TABLES" ]]; then
+  IFS=',' read -r -a _skip <<< "$SKIP_DATA_TABLES"
+  for t in "${_skip[@]}"; do
+    t="${t//[[:space:]]/}"; [[ -z "$t" ]] && continue
+    t_exists="$(src_q "SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA='$DBQ' AND TABLE_NAME='$(sql_quote "$t")' AND TABLE_TYPE='BASE TABLE'")"
+    [[ "$t_exists" == "1" ]] || die "--skip-data: '$t' is not a base table in '$DB' on source"
+    SKIP_TABLES+=("$t")
+  done
+  if [[ ${#SKIP_TABLES[@]} -gt 0 ]]; then info "Structure only, no data, for: ${SKIP_TABLES[*]}"; fi
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Find non-system users with privileges on the database
@@ -247,6 +269,7 @@ fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   info "[dry-run] Would create target database '$DST_DB' (CHARSET $CHARSET, COLLATE ${COLLATION:-default}) — skipped."
   info "[dry-run] Would mysqldump source database '$DB' and load it into '$DST_DB' — skipped."
+  if [[ ${#SKIP_TABLES[@]} -gt 0 ]]; then info "[dry-run] (structure only, no data, for: ${SKIP_TABLES[*]})"; fi
   info "DRY RUN complete. No changes were made on source or target."
   exit 0
 fi
@@ -261,11 +284,27 @@ fi
 # ---------------------------------------------------------------------------
 # 4. Dump + load the database contents
 # ---------------------------------------------------------------------------
+IGNORE_ARGS=()
+for t in ${SKIP_TABLES[@]+"${SKIP_TABLES[@]}"}; do IGNORE_ARGS+=("--ignore-table=$DB.$t"); done
+
 info "Dumping source database '$DB'…"
 "$DUMP_BIN" --defaults-extra-file="$SRC_CNF" \
   --single-transaction --quick --routines --triggers --events \
   --set-gtid-purged=OFF --no-tablespaces \
-  "$DB" > "$DB_DUMP"
+  ${IGNORE_ARGS[@]+"${IGNORE_ARGS[@]}"} "$DB" > "$DB_DUMP"
+
+if [[ ${#SKIP_TABLES[@]} -gt 0 ]]; then
+  # Structure (+ triggers) only for the skipped tables. Loaded FIRST so views
+  # in the main dump that reference them can be created; the dump disables
+  # FOREIGN_KEY_CHECKS itself, so FK order doesn't matter.
+  info "Dumping structure only for: ${SKIP_TABLES[*]}…"
+  "$DUMP_BIN" --defaults-extra-file="$SRC_CNF" \
+    --no-data --triggers --skip-routines --skip-events \
+    --set-gtid-purged=OFF --no-tablespaces \
+    "$DB" "${SKIP_TABLES[@]}" > "$SCHEMA_ONLY_DUMP"
+  info "Loading structure-only tables into '$DST_DB'…"
+  "$MYSQL_BIN" --defaults-extra-file="$DST_CNF" "$DST_DB" < "$SCHEMA_ONLY_DUMP"
+fi
 
 info "Loading into target database '$DST_DB'…"
 "$MYSQL_BIN" --defaults-extra-file="$DST_CNF" "$DST_DB" < "$DB_DUMP"

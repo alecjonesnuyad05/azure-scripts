@@ -88,8 +88,17 @@ export DST_MYSQL_PWD='...'
 ./mysql_migrate_db.sh --db mydb \
     --src-host born1 --src-admin root \
     --dst-host born3 --dst-admin root \
-    [--dst-db newname] [--force-user] [--drop-existing] [--keep-dumps] [--dry-run]
+    [--dst-db newname] [--force-user] [--drop-existing] [--keep-dumps] \
+    [--skip-data sessions,audit_log] [--dry-run]
 ```
+`--skip-data t1,t2` (repeatable, or `SKIP_DATA_TABLES` in the env file; the
+CLI replaces the env value) copies those tables' **structure only**:
+columns, indexes and triggers, but no rows. They're excluded from the main
+dump with `--ignore-table`, dumped separately with `--no-data`, and loaded
+*before* the main dump so views that reference them still create. Each name
+must be a base table on the source, or the script dies up front. The
+base-table count check still matches, because the empty tables exist.
+
 `--help` prints full usage. `--dry-run` runs all the read-only checks
 (connectivity, DB existence, which users hold privileges on it, whether the
 target DB/users already exist) and prints exactly what would happen, without
