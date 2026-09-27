@@ -164,6 +164,15 @@ defaults.** Copy `.env.azure.example` to `.env.azure` to get started; never
 commit the real file. Requires `az` (Azure CLI) and `azcopy` on PATH. Run
 under Bash, not PowerShell.
 
+**Staging region:** `az disk create --source <blob>` only accepts a blob in
+the disk's own region, so the staging account must be in `--dst-location`.
+The auto-generated staging name hashes disk + RG + region, so a leftover
+account from a run that targeted another region isn't reused. If an existing
+account (auto-named or `--staging-account`) is in the wrong region, the script
+dies before the copy starts, and `--dry-run` runs the same check. Cleanup
+deletes only the staged blob; the staging account and container are left in
+place.
+
 **Consistency note:** a snapshot of a disk attached to a running VM is
 crash-consistent, not application-consistent. For a clean copy, stop/
 deallocate the source VM first — the script does not do this for you.
